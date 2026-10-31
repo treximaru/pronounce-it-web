@@ -9,6 +9,8 @@ Endpoints:
     GET /api/search?q=<query>  -> JSON list of entries, exact match first
     GET /api/word/<word>       -> JSON single entry (exact, case-insensitive)
     GET /api/stats             -> JSON {words, glossed}
+    GET /api/tts?text=<word>   -> neural TTS mp3 (voice=sonia|ryan, rate=normal|slow),
+                                  generated once via edge-tts then cached
 
 Env:
     KAMUS_DB   path to kamus_v26.sqlite (default: ./kamus_v26.sqlite)
@@ -17,7 +19,10 @@ Env:
 """
 import json
 import os
+import re
 import sqlite3
+import subprocess
+import sys
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,8 +30,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("KAMUS_DB", os.path.join(BASE, "kamus_v26.sqlite"))
 STATIC_DIR = os.path.join(BASE, "static")
+TTS_CACHE = os.path.join(BASE, "tts_cache")
 PORT = int(os.environ.get("PORT", "8888"))
 BIND = os.environ.get("BIND", "0.0.0.0")
+
+# Neural voices (Microsoft Edge TTS, free). Keys are what the API accepts.
+TTS_VOICES = {"sonia": "en-GB-SoniaNeural",   # female
+              "ryan": "en-GB-RyanNeural"}     # male
+TTS_RATES = {"normal": "+0%", "slow": "-30%"}
+TTS_WORD_RE = re.compile(r"^[a-zA-Z' -]{1,40}$")
+TTS_TIMEOUT = 30
 
 COLS = ("id, word, pos, definition_en, example, ipa_us, ipa_uk, ipa_other, "
         "syllables, syllable_count, stress_index, freq_rank, gloss_id, "
@@ -76,6 +89,40 @@ def stats():
             "SELECT COUNT(*) FROM words "
             "WHERE gloss_id IS NOT NULL AND gloss_id <> ''").fetchone()[0]
         return {"words": total, "glossed": glossed}
+
+
+tts_lock = threading.Lock()
+
+
+def tts_mp3(text, voice_key, rate_key):
+    """Return path to cached neural-TTTS mp3, generating it on first request."""
+    voice = TTS_VOICES[voice_key]
+    rate = TTS_RATES[rate_key]
+    safe = text.strip().lower().replace(" ", "_")
+    path = os.path.join(TTS_CACHE, voice_key, rate_key, safe + ".mp3")
+    if os.path.isfile(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with tts_lock:
+        if os.path.isfile(path):  # another thread beat us
+            return path
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "edge_tts",
+                 "--voice", voice, "--rate=%s" % rate,
+                 "--text", text, "--write-media", tmp],
+                timeout=TTS_TIMEOUT, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if not os.path.isfile(path):
+        raise RuntimeError("tts generation failed")
+    return path
 
 
 MIME = {".html": "text/html; charset=utf-8",
@@ -139,6 +186,29 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "not found"}, 404)
                 else:
                     self._send_json(entry)
+            elif path == "/api/tts":
+                qs = urllib.parse.parse_qs(parsed.query)
+                text = qs.get("text", [""])[0]
+                voice_key = qs.get("voice", ["sonia"])[0]
+                rate_key = qs.get("rate", ["normal"])[0]
+                if (not TTS_WORD_RE.match(text)
+                        or voice_key not in TTS_VOICES
+                        or rate_key not in TTS_RATES):
+                    self._send_json({"error": "bad request"}, 400)
+                    return
+                try:
+                    mp3 = tts_mp3(text, voice_key, rate_key)
+                except Exception:  # noqa: BLE001 - fall back to browser TTS
+                    self._send_json({"error": "tts unavailable"}, 502)
+                    return
+                with open(mp3, "rb") as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mpeg")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 self._serve_static(path)
         except BrokenPipeError:
