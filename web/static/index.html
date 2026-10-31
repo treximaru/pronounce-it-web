@@ -181,6 +181,11 @@ function speak(word, kind) {
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+function posLabel(w) {
+  const pa = (w.pos_all || w.pos || "").split(",").filter(Boolean);
+  return pa.join(" · ");
+}
+
 function syllablesHtml(w) {
   if (!w.syllables) return "";
   const parts = w.syllables.split("·");
@@ -223,7 +228,7 @@ function showDetail(w) {
     ? `<details class="more"><summary>Detail lengkap</summary>${secondary}</details>`
     : secondary;
   detailEl.innerHTML =
-    `<div><span class="word">${esc(w.word)}</span><span class="pos">${esc(w.pos || "")}</span></div>` +
+    `<div><span class="word">${esc(w.word)}</span><span class="pos">${esc(posLabel(w))}</span></div>` +
     (w.ipa_uk ? `<div class="ipa">/${esc(w.ipa_uk)}/</div>` : "") +
     `<div class="speakrow">
        <button data-say="normal">🔊 Listen</button>

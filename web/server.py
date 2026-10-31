@@ -43,7 +43,7 @@ TTS_TIMEOUT = 30
 
 COLS = ("id, word, pos, definition_en, example, ipa_us, ipa_uk, ipa_other, "
         "syllables, syllable_count, stress_index, freq_rank, gloss_id, "
-        "synonyms, antonyms, gloss_source")
+        "synonyms, antonyms, gloss_source, pos_all")
 
 db_lock = threading.Lock()
 db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(DB_PATH),
@@ -179,6 +179,10 @@ def lookup(word):
         if r is None:
             return None
         d = dict(r)
+        # known verb inflections (went, gone, ...) always list verb first
+        pa = d.get("pos_all") or ""
+        if d["word"] in IRREG_FORM and "verb" not in pa.split(","):
+            d["pos_all"] = "verb," + pa if pa else "verb"
         vf = verb_forms(d["word"], d.get("pos"))
         if vf:
             d["verb_forms"] = vf
