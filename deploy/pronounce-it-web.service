@@ -1,0 +1,15 @@
+[Unit]
+Description=Pronounce It! web dictionary
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/muse/pronounce-it-web
+Environment=PORT=8888
+ExecStart=/usr/bin/python3 /home/ubuntu/muse/pronounce-it-web/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
