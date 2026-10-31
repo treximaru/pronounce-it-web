@@ -34,6 +34,17 @@
   #aboutModal p { font-size:14px; line-height:1.5; margin:0 0 6px; }
   #aboutModal .ver { color:var(--muted); font-size:13px; }
   #aboutModal .ded { margin:14px 0; }
+  /* ---------- verb forms ---------- */
+  .vforms { display:flex; gap:8px; margin:2px 0 4px; }
+  .vforms > div { flex:1; background:var(--card); border:1px solid var(--line);
+    border-radius:10px; padding:8px 4px; text-align:center; }
+  .vforms > div > span { display:block; font-size:11px; color:var(--muted);
+    margin-bottom:4px; }
+  .vforms a { font-size:17px; font-weight:700; color:var(--accent);
+    text-decoration:none; }
+  .vforms a:active { text-decoration:underline; }
+  .vfnote { font-size:13px; color:var(--muted); margin:6px 0 2px; }
+  .vfnote a { color:var(--accent); text-decoration:none; }
   /* ---------- mobile: simpler, bigger touch targets ---------- */
   body.mobile header p { display:none; }
   body.mobile .word { font-size:30px; }
@@ -178,6 +189,28 @@ function syllablesHtml(w) {
     parts.map((p, i) => i === idx ? `<b>${esc(p)}</b>` : esc(p)).join(" &middot; ") + `</div>`;
 }
 
+function verbFormsHtml(w) {
+  const vf = w.verb_forms;
+  if (!vf) return "";
+  const link = f => vf.links[f]
+    ? `<a href="#" data-w="${esc(f)}">${esc(f)}</a>` : `<span>${esc(f)}</span>`;
+  const cells = [
+    ["V1", link(vf.v1)],
+    ["V2 · past", vf.v2.map(link).join(" / ")],
+    ["V3 · participle", vf.v3.map(link).join(" / ")],
+  ];
+  let note = "";
+  if (vf.kind === "v2")
+    note = `<div class="vfnote">&ldquo;${esc(w.word)}&rdquo; is the past tense (V2) of ${link(vf.v1)}.</div>`;
+  else if (vf.kind === "v3")
+    note = `<div class="vfnote">&ldquo;${esc(w.word)}&rdquo; is the past participle (V3) of ${link(vf.v1)}.</div>`;
+  const reg = vf.regular ? " (regular)" : "";
+  return `<div class="lbl">Verb forms${reg}</div>` +
+    `<div class="vforms">` +
+    cells.map(([k, v]) => `<div><span>${k}</span>${v}</div>`).join("") +
+    `</div>` + note;
+}
+
 function showDetail(w) {
   detailEl.style.display = "block";
   backBtn.style.display = "block";
@@ -196,13 +229,21 @@ function showDetail(w) {
        <button data-say="normal">🔊 Listen</button>
        <button data-say="slow">🐢 Slow</button>
      </div>` +
+    verbFormsHtml(w) +
     syllablesHtml(w) +
     (w.gloss_id ? `<div class="lbl">Arti (Indonesia)</div><div class="gloss">${esc(w.gloss_id)}</div>` : "") +
     secondaryHtml;
   detailEl.querySelectorAll("[data-say]").forEach(b =>
     b.addEventListener("click", () => speak(w.word, b.dataset.say)));
+  detailEl.querySelectorAll("a[data-w]").forEach(a =>
+    a.addEventListener("click", e => { e.preventDefault(); loadWord(a.dataset.w); }));
   resultsEl.style.display = "none";
   window.scrollTo(0, 0);
+}
+
+async function loadWord(word) {
+  const r = await fetch("/api/word/" + encodeURIComponent(word));
+  if (r.ok) showDetail(await r.json());
 }
 
 function showResults(list) {
@@ -219,10 +260,7 @@ function showResults(list) {
        <span class="g">${esc(w.gloss_id || w.ipa_uk || "")}</span>
      </div>`).join("");
   resultsEl.querySelectorAll(".res").forEach(el =>
-    el.addEventListener("click", async () => {
-      const r = await fetch("/api/word/" + encodeURIComponent(el.dataset.w));
-      if (r.ok) showDetail(await r.json());
-    }));
+    el.addEventListener("click", () => loadWord(el.dataset.w)));
 }
 
 let t = null;
@@ -232,11 +270,8 @@ async function doSearch() {
   if (r.ok) showResults(await r.json());
 }
 q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(doSearch, 200); });
-q.addEventListener("keydown", async e => {
-  if (e.key === "Enter" && lastQuery.trim()) {
-    const r = await fetch("/api/word/" + encodeURIComponent(lastQuery.trim()));
-    if (r.ok) showDetail(await r.json());
-  }
+q.addEventListener("keydown", e => {
+  if (e.key === "Enter" && lastQuery.trim()) loadWord(lastQuery.trim());
 });
 backBtn.addEventListener("click", () => doSearch());
 

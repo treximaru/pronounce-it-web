@@ -117,6 +117,30 @@ def _fuzzy_search(q, have, limit):
     return [d for _, _, d in found[:limit]]
 
 
+def _prefix_typo_search(q, have, limit):
+    """Last resort: the query is the damaged start of a longer word.
+
+    e.g. "aproxima" -> "approximately" (missing 'p' + unfinished).
+    Pattern: literal prefix, one gap for the typo, open suffix.
+    Only runs when the direct + single-typo tiers found almost nothing.
+    """
+    n = len(q)
+    found = []  # (prefix_len, freq_rank, row)
+    for i in range(1, n):
+        pat = _escape_like(q[:i]) + "%" + _escape_like(q[i:]) + "%"
+        cur = db.execute(
+            "SELECT %s FROM words WHERE word LIKE ? ESCAPE '\\' "
+            "AND LENGTH(word) BETWEEN ? AND ? LIMIT 4" % COLS,
+            (pat, n + 1, n + 6))
+        for r in cur.fetchall():
+            d = dict(r)
+            if d["word"] not in have:
+                have.add(d["word"])
+                found.append((i, d.get("freq_rank") or 10 ** 9, d))
+    found.sort(key=lambda x: (-x[0], x[1]))
+    return [d for _, _, d in found[:limit]]
+
+
 def search(query, limit=100):
     q = query.strip().lower()
     with db_lock:
@@ -139,6 +163,11 @@ def search(query, limit=100):
         if len(results) < 10 and 3 <= len(q) <= 20 and " " not in q:
             have = {r["word"] for r in results}
             results += _fuzzy_search(q, have, limit - len(results))
+        # Damaged prefix: query is the mistyped start of a longer word
+        # (e.g. "aproxima" -> "approximately").
+        if len(results) < 5 and 4 <= len(q) <= 20 and " " not in q:
+            have = {r["word"] for r in results}
+            results += _prefix_typo_search(q, have, limit - len(results))
         return results[:limit]
 
 
@@ -147,7 +176,281 @@ def lookup(word):
         cur = db.execute("SELECT %s FROM words WHERE word = ? LIMIT 1" % COLS,
                          (word.strip().lower(),))
         r = cur.fetchone()
-        return dict(r) if r else None
+        if r is None:
+            return None
+        d = dict(r)
+        vf = verb_forms(d["word"], d.get("pos"))
+        if vf:
+            d["verb_forms"] = vf
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Verb principal parts (v1 / v2 past / v3 past participle).
+# The DB stores a single pos per word and it is unreliable for verbs
+# ("go" is tagged noun), so verb detection uses this irregular table plus
+# regular -ed rules, with every linked form verified against the DB.
+# ---------------------------------------------------------------------------
+_IRREGULAR_TXT = """
+arise arose arisen
+awake awoke awoken
+be was/were been
+bear bore born
+beat beat beaten
+become became become
+begin began begun
+bend bent bent
+bet bet bet
+bid bid bid
+bind bound bound
+bite bit bitten
+bleed bled bled
+blow blew blown
+break broke broken
+breed bred bred
+bring brought brought
+build built built
+burn burnt burnt
+burst burst burst
+buy bought bought
+cast cast cast
+catch caught caught
+choose chose chosen
+cling clung clung
+come came come
+cost cost cost
+creep crept crept
+cut cut cut
+deal dealt dealt
+dig dug dug
+do did done
+draw drew drawn
+dream dreamt dreamt
+drink drank drunk
+drive drove driven
+eat ate eaten
+fall fell fallen
+feed fed fed
+feel felt felt
+fight fought fought
+find found found
+fit fit fit
+flee fled fled
+fling flung flung
+fly flew flown
+forbid forbade forbidden
+forget forgot forgotten
+forgive forgave forgiven
+freeze froze frozen
+get got got
+give gave given
+go went gone
+grind ground ground
+grow grew grown
+hang hung hung
+have had had
+hear heard heard
+hide hid hidden
+hit hit hit
+hold held held
+hurt hurt hurt
+keep kept kept
+kneel knelt knelt
+know knew known
+lay laid laid
+lead led led
+lean leant leant
+learn learnt learnt
+leave left left
+lend lent lent
+let let let
+lie lay lain
+light lit lit
+lose lost lost
+make made made
+mean meant meant
+meet met met
+pay paid paid
+put put put
+quit quit quit
+read read read
+ride rode ridden
+ring rang rung
+rise rose risen
+run ran run
+say said said
+see saw seen
+seek sought sought
+sell sold sold
+send sent sent
+set set set
+sew sewed sewn
+shake shook shaken
+shine shone shone
+shoot shot shot
+show showed shown
+shrink shrank shrunk
+shut shut shut
+sing sang sung
+sink sank sunk
+sit sat sat
+sleep slept slept
+slide slid slid
+smell smelt smelt
+sow sowed sown
+speak spoke spoken
+speed sped sped
+spell spelt spelt
+spend spent spent
+spill spilt spilt
+spin spun spun
+split split split
+spoil spoilt spoilt
+spread spread spread
+spring sprang sprung
+stand stood stood
+steal stole stolen
+stick stuck stuck
+sting stung stung
+stink stank stunk
+strike struck struck
+swear swore sworn
+sweep swept swept
+swim swam swum
+swing swung swung
+take took taken
+teach taught taught
+tear tore torn
+tell told told
+think thought thought
+throw threw thrown
+thrust thrust thrust
+understand understood understood
+wake woke woken
+wear wore worn
+weep wept wept
+win won won
+wind wound wound
+withdraw withdrew withdrawn
+wring wrung wrung
+write wrote written
+"""
+
+
+def _parse_irregular():
+    base2forms = {}
+    form2base = {}
+    for line in _IRREGULAR_TXT.strip().split("\n"):
+        p = line.split()
+        if len(p) != 3:
+            continue
+        base, v2, v3 = p
+        v2s = v2.split("/")
+        v3s = v3.split("/")
+        base2forms[base] = (v2s, v3s)
+        for v in v2s:
+            form2base.setdefault(v, (base, "v2"))
+        for v in v3s:
+            form2base.setdefault(v, (base, "v3"))
+    return base2forms, form2base
+
+
+IRREG_BASE, IRREG_FORM = _parse_irregular()
+
+
+def _regular_past_candidates(base):
+    """Candidate v2/v3 spellings for a regular verb, simplest first."""
+    b = base.lower()
+    if b.endswith("e"):
+        return [b + "d"]              # dance -> danced
+    if b.endswith("c"):
+        return [b + "ked"]            # panic -> panicked
+    if len(b) > 2 and b.endswith("y") and b[-2] not in "aeiouy":
+        return [b[:-1] + "ied"]       # study -> studied
+    cands = [b + "ed"]                # play -> played
+    # CVC doubling as alternative: stop -> stopped (DB check decides)
+    if (len(b) >= 3 and b[-1] not in "aeiouwxy"
+            and b[-2] in "aeiou" and b[-3] not in "aeiou"):
+        cands.append(b + b[-1] + "ed")
+    return cands
+
+
+def _word_exists(w):
+    cur = db.execute("SELECT 1 FROM words WHERE word = ? LIMIT 1", (w,))
+    return cur.fetchone() is not None
+
+
+def _regular_base_candidates(w):
+    """Candidate base forms for a word that looks like a regular past tense."""
+    cands = []
+    if w.endswith("ied") and len(w) > 4:
+        cands.append(w[:-3] + "y")     # studied -> study
+    if w.endswith("ed") and len(w) > 3:
+        stem = w[:-2]
+        if (len(stem) >= 2 and stem[-1] == stem[-2]
+                and stem[-1] not in "aeiou"):
+            cands.append(stem[:-1])    # stopped -> stop
+        cands.append(stem)             # wanted -> want
+        cands.append(stem + "e")       # liked -> like
+    return cands
+
+
+def verb_forms(word, pos):
+    """Return verb principal parts for a word, or None.
+
+    {"v1": str, "v2": [str], "v3": [str], "kind": "base"|"v2"|"v3",
+     "regular": bool, "links": {form: bool-in-db}}.
+    Must be called with db_lock held.
+    """
+    w = word.lower()
+    # 1) irregular, queried as base form
+    if w in IRREG_BASE:
+        v2s, v3s = IRREG_BASE[w]
+        forms = [w] + v2s + v3s
+        return {"v1": w, "v2": v2s, "v3": v3s, "kind": "base",
+                "regular": False,
+                "links": {f: _word_exists(f) for f in forms}}
+    # 2) irregular, queried as v2/v3 -> point back to base
+    if w in IRREG_FORM:
+        base, kind = IRREG_FORM[w]
+        v2s, v3s = IRREG_BASE[base]
+        forms = [base] + v2s + v3s
+        return {"v1": base, "v2": v2s, "v3": v3s, "kind": kind,
+                "regular": False,
+                "links": {f: _word_exists(f) for f in forms}}
+    # 3) regular verb: DB says verb, or its -ed form exists as evidence
+    v2 = None
+    if pos == "verb":
+        for c in _regular_past_candidates(w):
+            if _word_exists(c):
+                v2 = c
+                break
+        if v2 is None:
+            v2 = _regular_past_candidates(w)[0]  # computed, shown as text
+    else:
+        for c in _regular_past_candidates(w):
+            if _word_exists(c):
+                v2 = c
+                break
+    if v2 is not None:
+        return {"v1": w, "v2": [v2], "v3": [v2], "kind": "base",
+                "regular": True,
+                "links": {w: True, v2: _word_exists(v2)}}
+    # 4) reverse regular: word looks like a past tense (played -> play)
+    if w.endswith("ed"):
+        for b in _regular_base_candidates(w):
+            if b in IRREG_BASE:
+                continue  # irregular bases handled above
+            cur = db.execute("SELECT pos FROM words WHERE word = ?",
+                             (b,))
+            r = cur.fetchone()
+            if r and r[0] == "verb" and _regular_past_candidates(b)[0] == w:
+                v2c = _regular_past_candidates(b)
+                v2ok = next((c for c in v2c if _word_exists(c)), v2c[0])
+                return {"v1": b, "v2": [v2ok], "v3": [v2ok], "kind": "v2",
+                        "regular": True,
+                        "links": {b: True, v2ok: _word_exists(v2ok)}}
+    return None
 
 
 def stats():
