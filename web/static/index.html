@@ -34,6 +34,19 @@
   #aboutModal p { font-size:14px; line-height:1.5; margin:0 0 6px; }
   #aboutModal .ver { color:var(--muted); font-size:13px; }
   #aboutModal .ded { margin:14px 0; }
+  /* ---------- mobile: simpler, bigger touch targets ---------- */
+  body.mobile header p { display:none; }
+  body.mobile .word { font-size:30px; }
+  body.mobile .ipa { font-size:19px; }
+  body.mobile .speakrow button { padding:14px 22px; font-size:17px; }
+  body.mobile .speakrow { gap:12px; margin:14px 0; }
+  body.mobile .res { padding:14px 12px; }
+  body.mobile .res .w { font-size:17px; }
+  body.mobile details.more { margin-top:14px; border-top:1px solid var(--line);
+    padding-top:10px; }
+  body.mobile details.more summary { font-size:15px; font-weight:600;
+    color:var(--accent); cursor:pointer; padding:6px 0; }
+  body.mobile footer .src { display:none; }
   #q { width:100%; font-size:17px; padding:11px 14px; border-radius:12px;
        border:1px solid var(--line); background:var(--bg); color:var(--ink);
        outline:none; }
@@ -116,6 +129,11 @@ const $ = s => document.querySelector(s);
 const q = $("#q"), resultsEl = $("#results"), detailEl = $("#detail"), backBtn = $("#back");
 let lastQuery = "";
 
+/* ---------- mobile: simpler layout on phones ---------- */
+const isMobile = window.matchMedia("(max-width: 640px)").matches ||
+                 /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+if (isMobile) document.body.classList.add("mobile");
+
 /* ---------- speech: neural TTS from server, browser fallback ---------- */
 let voice = null;
 function pickVoice() {
@@ -166,6 +184,11 @@ function showDetail(w) {
   const syn = w.synonyms ? `<div class="lbl">Synonyms</div><div class="chips">${esc(w.synonyms)}</div>` : "";
   const ant = w.antonyms ? `<div class="lbl">Antonyms</div><div class="chips">${esc(w.antonyms)}</div>` : "";
   const ex  = w.example ? `<div class="lbl">Example</div><div class="ex">&ldquo;${esc(w.example)}&rdquo;</div>` : "";
+  // mobile: secondary info collapses into "Detail lengkap" for a simpler view
+  const secondary = (w.definition_en ? `<div class="lbl">Definition</div><div>${esc(w.definition_en)}</div>` : "") + syn + ant + ex;
+  const secondaryHtml = (isMobile && secondary)
+    ? `<details class="more"><summary>Detail lengkap</summary>${secondary}</details>`
+    : secondary;
   detailEl.innerHTML =
     `<div><span class="word">${esc(w.word)}</span><span class="pos">${esc(w.pos || "")}</span></div>` +
     (w.ipa_uk ? `<div class="ipa">/${esc(w.ipa_uk)}/</div>` : "") +
@@ -175,8 +198,7 @@ function showDetail(w) {
      </div>` +
     syllablesHtml(w) +
     (w.gloss_id ? `<div class="lbl">Arti (Indonesia)</div><div class="gloss">${esc(w.gloss_id)}</div>` : "") +
-    (w.definition_en ? `<div class="lbl">Definition</div><div>${esc(w.definition_en)}</div>` : "") +
-    syn + ant + ex;
+    secondaryHtml;
   detailEl.querySelectorAll("[data-say]").forEach(b =>
     b.addEventListener("click", () => speak(w.word, b.dataset.say)));
   resultsEl.style.display = "none";

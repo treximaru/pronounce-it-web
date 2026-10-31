@@ -55,6 +55,68 @@ def _escape_like(s):
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _row_dicts(cur):
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _typo_variants(q):
+    """Yield (kind, pattern, rank) for single-typo variants of q.
+
+    Covers the most common mistypes: swapped adjacent letters, one extra
+    letter, one wrong letter, one missing letter. All patterns stay
+    index-friendly (exact lookups or LIKE with a literal prefix).
+    """
+    n = len(q)
+    seen = set()
+    # transposition: "komupter" -> "komputer" (exact lookup)
+    for i in range(n - 1):
+        v = q[:i] + q[i + 1] + q[i] + q[i + 2:]
+        if v != q and v not in seen:
+            seen.add(v)
+            yield ("exact", v, 30)
+    # deletion: typed one extra letter, e.g. "kompuuter" -> "komputer"
+    for i in range(n):
+        v = q[:i] + q[i + 1:]
+        if v not in seen:
+            seen.add(v)
+            yield ("exact", v, 31)
+    # substitution: one wrong letter, e.g. "komxuter" -> "komputer"
+    for i in range(n):
+        yield ("like", _escape_like(q[:i]) + "_" + _escape_like(q[i + 1:]), 40)
+    # insertion: missed one letter, e.g. "kompter" -> "komputer".
+    # LENGTH = n+1 forces the wildcard to stand for exactly one letter,
+    # so these are near-certain corrections -> rank right after exact ones.
+    # (i=0 skipped: no literal prefix, full scan, lowest value)
+    for i in range(1, n + 1):
+        yield ("like_ins", _escape_like(q[:i]) + "%" + _escape_like(q[i:]), 32)
+
+
+def _fuzzy_search(q, have, limit):
+    """Append typo-tolerant matches for q. `have` is the set of words already shown."""
+    found = []  # (rank, freq_rank, row)
+    n = len(q)
+    for kind, pattern, rank in _typo_variants(q):
+        if kind == "exact":
+            cur = db.execute(
+                "SELECT %s FROM words WHERE word = ? LIMIT 3" % COLS, (pattern,))
+        elif kind == "like":
+            cur = db.execute(
+                "SELECT %s FROM words WHERE word LIKE ? ESCAPE '\\' "
+                "AND LENGTH(word) = ? LIMIT 5" % COLS, (pattern, n))
+        else:  # like_ins: exactly one missing letter
+            cur = db.execute(
+                "SELECT %s FROM words WHERE word LIKE ? ESCAPE '\\' "
+                "AND LENGTH(word) = ? LIMIT 5" % COLS,
+                (pattern, n + 1))
+        for r in cur.fetchall():
+            d = dict(r)
+            if d["word"] not in have:
+                have.add(d["word"])
+                found.append((rank, d.get("freq_rank") or 10 ** 9, d))
+    found.sort(key=lambda x: (x[0], x[1]))
+    return [d for _, _, d in found[:limit]]
+
+
 def search(query, limit=100):
     q = query.strip().lower()
     with db_lock:
@@ -63,15 +125,21 @@ def search(query, limit=100):
                 "SELECT %s FROM words "
                 "ORDER BY (freq_rank IS NULL) ASC, freq_rank ASC, word ASC "
                 "LIMIT ?" % COLS, (limit,))
-        else:
-            e = _escape_like(q)
-            cur = db.execute(
-                "SELECT %s FROM words WHERE word LIKE ? ESCAPE '\\' "
-                "ORDER BY (LOWER(word) = ?) DESC, (word LIKE ? ESCAPE '\\') DESC, "
-                "(freq_rank IS NULL) ASC, freq_rank ASC, word ASC "
-                "LIMIT ?" % COLS,
-                ("%%%s%%" % e, q, "%s%%" % e, limit))
-        return [dict(r) for r in cur.fetchall()]
+            return _row_dicts(cur)
+        e = _escape_like(q)
+        cur = db.execute(
+            "SELECT %s FROM words WHERE word LIKE ? ESCAPE '\\' "
+            "ORDER BY (LOWER(word) = ?) DESC, (word LIKE ? ESCAPE '\\') DESC, "
+            "(freq_rank IS NULL) ASC, freq_rank ASC, word ASC "
+            "LIMIT ?" % COLS,
+            ("%%%s%%" % e, q, "%s%%" % e, limit))
+        results = _row_dicts(cur)
+        # Typo tolerance: when the direct search is thin, try single-typo
+        # variants (swapped / extra / wrong / missing letter).
+        if len(results) < 10 and 3 <= len(q) <= 20 and " " not in q:
+            have = {r["word"] for r in results}
+            results += _fuzzy_search(q, have, limit - len(results))
+        return results[:limit]
 
 
 def lookup(word):
